@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"testing"
@@ -670,10 +671,14 @@ func TestGetProjectWorkflow_NotFound(t *testing.T) {
 
 // TestGetProjectWorkflow_PausedInterrupt guards W1: a paused project surfaces
 // as a human interrupt (LangGraph semantics) in addition to status=paused.
+// Since the lifecycle write API, the interrupt carries an action_request (resume) + config
+// (allow_accept) aligned with the LangChain Agent Inbox HumanInterrupt model,
+// so a dashboard can render a "Resume" button.
 func TestGetProjectWorkflow_PausedInterrupt(t *testing.T) {
 	store := ossfake.NewMemory()
 	putProject(store, "shared/projects/paused1/meta.json", map[string]any{
-		"project_id": "paused1", "title": "Paused", "status": "paused", "plan_type": "dag", "tasks": []map[string]any{},
+		"project_id": "paused1", "title": "Paused", "status": "paused", "plan_type": "dag",
+		"pause_reason": "customer review", "tasks": []map[string]any{},
 	})
 	h := newProjectTestHandler(t, store)
 
@@ -690,14 +695,25 @@ func TestGetProjectWorkflow_PausedInterrupt(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &wf); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	found := false
-	for _, in := range wf.Interrupts {
-		if in.ID == "project" && in.Value == "paused" {
-			found = true
+	var found *workflowInterrupt
+	for i := range wf.Interrupts {
+		if wf.Interrupts[i].ID == "project" && wf.Interrupts[i].Value == "paused" {
+			found = &wf.Interrupts[i]
+			break
 		}
 	}
-	if !found {
+	if found == nil {
 		t.Fatalf("expected paused project interrupt, got %+v", wf.Interrupts)
+	}
+	// the lifecycle write API: action_request + config + description aligned with Agent Inbox.
+	if found.ActionRequest == nil || found.ActionRequest.Action != "resume" {
+		t.Fatalf("paused interrupt action_request=%+v, want resume", found.ActionRequest)
+	}
+	if found.Config == nil || !found.Config.AllowAccept {
+		t.Fatalf("paused interrupt config=%+v, want allow_accept", found.Config)
+	}
+	if !strings.Contains(found.Description, "customer review") {
+		t.Fatalf("paused interrupt description=%q, want to include pause reason", found.Description)
 	}
 }
 
@@ -1256,8 +1272,127 @@ func TestProjectHTTP_L2AuthChain(t *testing.T) {
 	}
 }
 
+// TestProjectHTTP_L2WriteChain exercises the the lifecycle write API write path through the
+// full HTTP chain — bearer extraction -> composite auth -> identity
+// enrichment -> authorizer (ActionUpdate + project -> requireSameTeam) ->
+// handler (checkProjectAccess + mtime lock) — for an L2 human:
+//
+//   - pause an accessible-team project via the real HTTP stack -> 200
+//   - pause a non-accessible team project -> 404 (existence hidden)
+//   - create with a non-accessible team -> 404
+func TestProjectHTTP_L2WriteChain(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "teams/alpha-team/shared/projects/pa/meta.json", map[string]any{
+		"project_id": "pa", "title": "PA", "status": "active", "plan_type": "dag", "team_id": "alpha-team",
+	})
+	scheme := newProjectTestScheme(t)
+	human := &v1beta1.Human{
+		ObjectMeta: metav1.ObjectMeta{Name: "maizong", Namespace: "default"},
+		Spec:       v1beta1.HumanSpec{Username: "maizong", PermissionLevel: 2, AccessibleTeams: []string{"alpha-team"}},
+	}
+	k8s := fake.NewClientBuilder().WithScheme(scheme).
+		WithRuntimeObjects(human, team("alpha-team"), team("beta-team")).Build()
+
+	matrixAuth := authpkg.NewMatrixTokenAuthenticator(k8s, "default", &staticWhoami{validToken: "matrix-token", userID: "@maizong:matrix.local"})
+	composite := authpkg.NewCompositeAuthenticator(&alwaysFailAuth{}, matrixAuth)
+	enricher := authpkg.NewCREnricher(k8s, "default")
+	mw := authpkg.NewMiddleware(composite, enricher, authpkg.NewAuthorizer(), k8s, "default")
+
+	var ossStore oss.StorageClient = &mcLikeOSS{Memory: store}
+	srv := NewHTTPServer(":0", ServerDeps{
+		Client:    k8s,
+		Namespace: "default",
+		OSS:       ossStore,
+		AuthMw:    mw,
+	})
+
+	// L2 human pauses an accessible team's project via the full HTTP chain.
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/pa/pause", strings.NewReader(`{"reason":"review"}`))
+	req.Header.Set("Authorization", "Bearer matrix-token")
+	rec := httptest.NewRecorder()
+	srv.Mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("L2 pause status=%d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	data, _ := store.GetObject(context.Background(), "teams/alpha-team/shared/projects/pa/meta.json")
+	var meta map[string]any
+	_ = json.Unmarshal(data, &meta)
+	if meta["status"] != "paused" || meta["pause_reason"] != "review" || meta["updated_by"] != "maizong (human)" {
+		t.Fatalf("meta after pause=%v, want paused/review/maizong (human)", meta)
+	}
+
+	// Cross-team pause -> 404 (existence hidden through the write path too).
+	putProject(store, "teams/beta-team/shared/projects/pb/meta.json", map[string]any{
+		"project_id": "pb", "title": "PB", "status": "active", "plan_type": "dag", "team_id": "beta-team",
+	})
+	req2 := httptest.NewRequest(http.MethodPost, "/api/v1/projects/pb/pause", nil)
+	req2.Header.Set("Authorization", "Bearer matrix-token")
+	rec2 := httptest.NewRecorder()
+	srv.Mux.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusNotFound {
+		t.Fatalf("L2 cross-team pause status=%d, want 404 (existence hidden)", rec2.Code)
+	}
+
+	// L2 create in a non-accessible team -> 404.
+	req3 := httptest.NewRequest(http.MethodPost, "/api/v1/projects", strings.NewReader(`{"title":"X","team_id":"beta-team"}`))
+	req3.Header.Set("Authorization", "Bearer matrix-token")
+	rec3 := httptest.NewRecorder()
+	srv.Mux.ServeHTTP(rec3, req3)
+	if rec3.Code != http.StatusNotFound {
+		t.Fatalf("L2 cross-team create status=%d, want 404", rec3.Code)
+	}
+}
+
+// alwaysAdminAuth is a fake Authenticator that always returns an admin
+// identity for the admin HTTP write-chain test.
+type alwaysAdminAuth struct{}
+
+func (a *alwaysAdminAuth) Authenticate(_ context.Context, _ string) (*authpkg.CallerIdentity, error) {
+	return &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"}, nil
+}
+
+// TestProjectHTTP_AdminWriteChain verifies an admin can create + complete a
+// project through the full HTTP chain (no team restriction).
+func TestProjectHTTP_AdminWriteChain(t *testing.T) {
+	store := ossfake.NewMemory()
+	scheme := newProjectTestScheme(t)
+	k8s := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(team("alpha-team")).Build()
+	enricher := authpkg.NewCREnricher(k8s, "default")
+	mw := authpkg.NewMiddleware(&alwaysAdminAuth{}, enricher, authpkg.NewAuthorizer(), k8s, "default")
+	var ossStore oss.StorageClient = &mcLikeOSS{Memory: store}
+	srv := NewHTTPServer(":0", ServerDeps{Client: k8s, Namespace: "default", OSS: ossStore, AuthMw: mw})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects", strings.NewReader(`{"title":"New","team_id":"alpha-team"}`))
+	req.Header.Set("Authorization", "Bearer sa-token")
+	rec := httptest.NewRecorder()
+	srv.Mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("admin create status=%d, want 201; body=%s", rec.Code, rec.Body.String())
+	}
+	var created struct {
+		ProjectID string `json:"project_id"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode create: %v", err)
+	}
+	if created.ProjectID == "" {
+		t.Fatal("create returned empty project_id")
+	}
+
+	// The created project is immediately visible to the admin via the
+	// workflow endpoint (dual-prefix scan finds the team-scoped meta).
+	req2 := httptest.NewRequest(http.MethodGet, "/api/v1/projects/"+created.ProjectID+"/workflow", nil)
+	req2.SetPathValue("id", created.ProjectID)
+	req2.Header.Set("Authorization", "Bearer sa-token")
+	rec2 := httptest.NewRecorder()
+	srv.Mux.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("admin workflow-after-create status=%d, want 200; body=%s", rec2.Code, rec2.Body.String())
+	}
+}
+
 // TestGetProjectWorkflow_PassThroughAuditFields guards W2: human-intervention
-// audit fields written by W-PR-2 (updated_by/updated_at/pause_reason) are
+// audit fields written by the lifecycle write API (updated_by/updated_at/pause_reason) are
 // passed through the workflow response.
 func TestGetProjectWorkflow_PassThroughAuditFields(t *testing.T) {
 	store := ossfake.NewMemory()
@@ -2828,5 +2963,1032 @@ func TestGetProjectSpawnMessages_SessionNotFound(t *testing.T) {
 	rec := spawnMessagesRequest(h, humanCaller(), "p1", "sub-unknown", "")
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status=%d, want 404 (session not owned by any worker)", rec.Code)
+	}
+}
+
+// =====================================================================// the lifecycle write API write endpoints (pause / resume / replan / create / cancel / complete)
+// ==============================================================// putTask writes a TaskMeta object for cancel-task tests.
+func putTask(store *ossfake.Memory, key string, meta map[string]any) {
+	data, _ := json.Marshal(meta)
+	_ = store.PutObject(context.Background(), key, data)
+}
+
+func TestPauseProject_ActiveToPaused(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "teams/alpha-team/shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag", "team_id": "alpha-team",
+	})
+	h := newProjectTestHandler(t, store, team("alpha-team"))
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/pause", strings.NewReader(`{"reason":"customer review"}`))
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.PauseProject(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	// Verify the MinIO write-back: status=paused + audit fields.
+	data, err := store.GetObject(context.Background(), "teams/alpha-team/shared/projects/p1/meta.json")
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	var meta map[string]any
+	if err := json.Unmarshal(data, &meta); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if meta["status"] != "paused" {
+		t.Fatalf("status=%v, want paused", meta["status"])
+	}
+	if meta["updated_by"] != "admin" {
+		t.Fatalf("updated_by=%v, want admin", meta["updated_by"])
+	}
+	if meta["updated_at"] == "" {
+		t.Fatalf("updated_at missing")
+	}
+	if meta["pause_reason"] != "customer review" {
+		t.Fatalf("pause_reason=%v, want customer review", meta["pause_reason"])
+	}
+}
+
+func TestPauseProject_AlreadyPaused409(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "paused", "plan_type": "dag",
+	})
+	h := newProjectTestHandler(t, store)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/pause", nil)
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.PauseProject(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status=%d, want 409 (already paused)", rec.Code)
+	}
+}
+
+func TestPauseProject_NotFound(t *testing.T) {
+	h := newProjectTestHandler(t, ossfake.NewMemory())
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/nope/pause", nil)
+	req.SetPathValue("id", "nope")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.PauseProject(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status=%d, want 404", rec.Code)
+	}
+}
+
+// TestPauseProject_MtimeConflict guards the optimistic lock: a worker
+// _sync_project push after the Controller read (before the write) must abort
+// the write with 409. The ossfake Memory advances its modTime on every
+// PutObject, so writing between read and write-back triggers the conflict.
+func TestPauseProject_EtagConflict(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag",
+	})
+	// The handler binds the read to its ETag, then performs a conditional
+	// write. Inject a "worker push" on the second StatMeta call (the
+	// conditional write's stat): the object's ETag changes, so the
+	// If-Match write fails -> 409.
+	// The wrapper embeds mcLikeOSS so ListObjects keeps the mc ls semantics
+	// (direct child names) that resolveProjectMetaWithKey depends on.
+	injector := &conflictInjectingOSS{mcLike: &mcLikeOSS{Memory: store}, injectOnGet: 1}
+	h := newProjectTestHandlerWithOSS(t, injector)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/pause", nil)
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.PauseProject(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status=%d body=%s, want 409 (mtime conflict)", rec.Code, rec.Body.String())
+	}
+}
+
+func TestResumeProject_PausedToActive(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "teams/alpha-team/shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "paused", "plan_type": "dag", "team_id": "alpha-team",
+	})
+	h := newProjectTestHandler(t, store, team("alpha-team"))
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/resume", nil)
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleTeamLeader, Username: "alpha-lead", Team: "alpha-team"})
+	rec := httptest.NewRecorder()
+	h.ResumeProject(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	data, _ := store.GetObject(context.Background(), "teams/alpha-team/shared/projects/p1/meta.json")
+	var meta map[string]any
+	_ = json.Unmarshal(data, &meta)
+	if meta["status"] != "active" {
+		t.Fatalf("status=%v, want active", meta["status"])
+	}
+}
+
+func TestResumeProject_NotPaused409(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag",
+	})
+	h := newProjectTestHandler(t, store)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/resume", nil)
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.ResumeProject(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status=%d, want 409 (not paused)", rec.Code)
+	}
+}
+
+// TestPauseProject_L2CrossTeamDenied guards B2c: an L2 human must be denied
+// (404, existence hidden) when pausing a project outside their
+// accessibleTeams.
+func TestPauseProject_L2CrossTeamDenied(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "teams/alpha-team/shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag", "team_id": "alpha-team",
+	})
+	h := newProjectTestHandler(t, store, team("alpha-team"), team("beta-team"))
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/pause", nil)
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "maizong", Teams: []string{"beta-team"}})
+	rec := httptest.NewRecorder()
+	h.PauseProject(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status=%d, want 404 (cross-team existence hidden)", rec.Code)
+	}
+}
+
+// TestPauseProject_L2SameTeamAllowed guards B2c: an L2 human may pause a
+// project in their accessibleTeams.
+func TestPauseProject_L2SameTeamAllowed(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "teams/alpha-team/shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag", "team_id": "alpha-team",
+	})
+	h := newProjectTestHandler(t, store, team("alpha-team"), team("beta-team"))
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/pause", nil)
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "sunzong", Teams: []string{"alpha-team", "beta-team"}})
+	rec := httptest.NewRecorder()
+	h.PauseProject(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200 (L2 same-team allowed)", rec.Code, rec.Body.String())
+	}
+}
+
+func TestReplanProject_ReplaceTasks(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag",
+		"tasks": []map[string]any{
+			{"task_id": "t1", "title": "Old T1", "assigned_to": "dev1", "status": "planned", "depends_on": []string{}},
+			{"task_id": "t2", "title": "Old T2", "assigned_to": "dev2", "status": "planned", "depends_on": []string{"t1"}},
+		},
+	})
+	h := newProjectTestHandler(t, store)
+
+	body := `{"tasks":[
+		{"taskId":"t1","title":"New T1"},
+		{"taskId":"t3","title":"T3","assignedTo":"dev3","dependsOn":["t1"]}
+	]}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/replan", strings.NewReader(body))
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.ReplanProject(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	data, _ := store.GetObject(context.Background(), "shared/projects/p1/meta.json")
+	var meta map[string]any
+	_ = json.Unmarshal(data, &meta)
+	tasks := meta["tasks"].([]any)
+	if len(tasks) != 2 {
+		t.Fatalf("tasks=%v, want 2 after replan", tasks)
+	}
+	// previous preservation: t1 keeps old title when not re-specified? No —
+	// the body DID specify title New T1, so it must be New T1.
+	first := tasks[0].(map[string]any)
+	if first["title"] != "New T1" || first["status"] != "planned" {
+		t.Fatalf("task t1=%v, want New T1/planned", first)
+	}
+	second := tasks[1].(map[string]any)
+	if second["title"] != "T3" || second["assigned_to"] != "dev3" {
+		t.Fatalf("task t3=%v, want T3/dev3", second)
+	}
+}
+
+// TestReplanProject_PreservesPrevious guards _normalize_task parity: a task id
+// that already exists keeps its previous title/assigned/status when the raw
+// entry omits them.
+func TestReplanProject_PreservesPrevious(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag",
+		"tasks": []map[string]any{
+			{"task_id": "t1", "title": "Original Title", "assigned_to": "dev1", "status": "assigned", "depends_on": []string{}},
+		},
+	})
+	h := newProjectTestHandler(t, store)
+
+	body := `{"tasks":[{"taskId":"t1"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/replan", strings.NewReader(body))
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.ReplanProject(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	data, _ := store.GetObject(context.Background(), "shared/projects/p1/meta.json")
+	var meta map[string]any
+	_ = json.Unmarshal(data, &meta)
+	tasks := meta["tasks"].([]any)
+	first := tasks[0].(map[string]any)
+	if first["title"] != "Original Title" || first["assigned_to"] != "dev1" || first["status"] != "assigned" {
+		t.Fatalf("preserved task=%v, want Original Title/dev1/assigned", first)
+	}
+}
+
+func TestReplanProject_DuplicateID400(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag", "tasks": []map[string]any{},
+	})
+	h := newProjectTestHandler(t, store)
+	body := `{"tasks":[{"taskId":"t1"},{"taskId":"t1"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/replan", strings.NewReader(body))
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.ReplanProject(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d, want 400 (duplicate id)", rec.Code)
+	}
+}
+
+func TestReplanProject_UnknownDependency400(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag", "tasks": []map[string]any{},
+	})
+	h := newProjectTestHandler(t, store)
+	body := `{"tasks":[{"taskId":"t1","dependsOn":["ghost"]}]}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/replan", strings.NewReader(body))
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.ReplanProject(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d, want 400 (unknown dependency)", rec.Code)
+	}
+}
+
+func TestReplanProject_Cycle400(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag", "tasks": []map[string]any{},
+	})
+	h := newProjectTestHandler(t, store)
+	body := `{"tasks":[{"taskId":"t1","dependsOn":["t2"]},{"taskId":"t2","dependsOn":["t1"]}]}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/replan", strings.NewReader(body))
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.ReplanProject(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d, want 400 (cycle)", rec.Code)
+	}
+}
+
+func TestReplanProject_NotDag409(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "loop",
+		"loop": map[string]any{"goal": "g", "tasks": []map[string]any{}},
+	})
+	h := newProjectTestHandler(t, store)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/replan", strings.NewReader(`{"tasks":[]}`))
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.ReplanProject(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status=%d, want 409 (loop plan)", rec.Code)
+	}
+}
+
+func TestReplanProject_NotActive409(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "paused", "plan_type": "dag", "tasks": []map[string]any{},
+	})
+	h := newProjectTestHandler(t, store)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/replan", strings.NewReader(`{"tasks":[]}`))
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.ReplanProject(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status=%d, want 409 (not active)", rec.Code)
+	}
+}
+
+func TestReplanProject_InFlight409(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag",
+		"tasks": []map[string]any{
+			{"task_id": "t1", "title": "T1", "status": "in_progress", "depends_on": []string{}},
+		},
+	})
+	h := newProjectTestHandler(t, store)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/replan", strings.NewReader(`{"tasks":[{"taskId":"t1"}]}`))
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.ReplanProject(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status=%d, want 409 (in-flight)", rec.Code)
+	}
+}
+
+func TestCreateProject_Admin(t *testing.T) {
+	store := ossfake.NewMemory()
+	h := newProjectTestHandler(t, store, team("alpha-team"))
+
+	body := `{"title":"New Project","source":"matrix","requester":"@luo:server","team_id":"alpha-team"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects", strings.NewReader(body))
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.CreateProject(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		ProjectID string `json:"project_id"`
+		Status    string `json:"status"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.ProjectID == "" || resp.Status != "active" {
+		t.Fatalf("resp=%+v, want generated id + active", resp)
+	}
+	// Verify the meta exists under the team-scoped prefix.
+	data, err := store.GetObject(context.Background(), "teams/alpha-team/shared/projects/"+resp.ProjectID+"/meta.json")
+	if err != nil {
+		t.Fatalf("created meta not found: %v", err)
+	}
+	var meta map[string]any
+	_ = json.Unmarshal(data, &meta)
+	if meta["status"] != "active" || meta["title"] != "New Project" || meta["team_id"] != "alpha-team" {
+		t.Fatalf("meta=%v", meta)
+	}
+}
+
+func TestCreateProject_L2CrossTeamDenied(t *testing.T) {
+	store := ossfake.NewMemory()
+	h := newProjectTestHandler(t, store, team("alpha-team"), team("beta-team"))
+
+	// L2 with only beta-team accessible tries to create in alpha-team.
+	body := `{"title":"X","team_id":"alpha-team"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects", strings.NewReader(body))
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleHuman, Username: "maizong", Teams: []string{"beta-team"}})
+	rec := httptest.NewRecorder()
+	h.CreateProject(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status=%d, want 404 (cross-team create denied)", rec.Code)
+	}
+}
+
+func TestCreateProject_Duplicate409(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag",
+	})
+	h := newProjectTestHandler(t, store)
+	body := `{"title":"Dup","project_id":"p1"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects", strings.NewReader(body))
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.CreateProject(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status=%d, want 409 (duplicate id)", rec.Code)
+	}
+}
+
+func TestCancelTask_ActiveTask(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag",
+		"tasks": []map[string]any{
+			{"task_id": "t1", "title": "T1", "status": "planned", "depends_on": []string{}},
+		},
+	})
+	putTask(store, "shared/tasks/t1/meta.json", map[string]any{
+		"task_id": "t1", "project_id": "p1", "status": "planned",
+	})
+	h := newProjectTestHandler(t, store)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/tasks/t1/cancel", strings.NewReader(`{"reason":"no longer needed","replacementTaskId":"t9"}`))
+	req.SetPathValue("id", "p1")
+	req.SetPathValue("taskId", "t1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.CancelTask(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	taskData, _ := store.GetObject(context.Background(), "shared/tasks/t1/meta.json")
+	var task map[string]any
+	_ = json.Unmarshal(taskData, &task)
+	if task["status"] != "cancelled" || task["cancel_reason"] != "no longer needed" || task["replacement_task_id"] != "t9" {
+		t.Fatalf("task=%v, want cancelled/reason/t9", task)
+	}
+	projData, _ := store.GetObject(context.Background(), "shared/projects/p1/meta.json")
+	var proj map[string]any
+	_ = json.Unmarshal(projData, &proj)
+	tasks := proj["tasks"].([]any)
+	if tasks[0].(map[string]any)["status"] != "cancelled" {
+		t.Fatalf("project node status=%v, want cancelled", tasks[0].(map[string]any)["status"])
+	}
+}
+
+func TestCancelTask_Terminal409(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag",
+		"tasks": []map[string]any{
+			{"task_id": "t1", "title": "T1", "status": "completed", "depends_on": []string{}},
+		},
+	})
+	putTask(store, "shared/tasks/t1/meta.json", map[string]any{
+		"task_id": "t1", "project_id": "p1", "status": "completed",
+	})
+	h := newProjectTestHandler(t, store)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/tasks/t1/cancel", strings.NewReader(`{"reason":"x"}`))
+	req.SetPathValue("id", "p1")
+	req.SetPathValue("taskId", "t1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.CancelTask(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status=%d, want 409 (terminal task)", rec.Code)
+	}
+}
+
+func TestCancelTask_NoReason400(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag",
+		"tasks": []map[string]any{
+			{"task_id": "t1", "title": "T1", "status": "planned", "depends_on": []string{}},
+		},
+	})
+	putTask(store, "shared/tasks/t1/meta.json", map[string]any{
+		"task_id": "t1", "project_id": "p1", "status": "planned",
+	})
+	h := newProjectTestHandler(t, store)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/tasks/t1/cancel", strings.NewReader(`{}`))
+	req.SetPathValue("id", "p1")
+	req.SetPathValue("taskId", "t1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.CancelTask(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d, want 400 (reason required)", rec.Code)
+	}
+}
+
+func TestCompleteProject_AllTerminal(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag",
+		"tasks": []map[string]any{
+			{"task_id": "t1", "title": "T1", "status": "completed", "depends_on": []string{}},
+			{"task_id": "t2", "title": "T2", "status": "cancelled", "depends_on": []string{"t1"}},
+		},
+	})
+	h := newProjectTestHandler(t, store)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/complete", nil)
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.CompleteProject(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	data, _ := store.GetObject(context.Background(), "shared/projects/p1/meta.json")
+	var meta map[string]any
+	_ = json.Unmarshal(data, &meta)
+	if meta["status"] != "completed" {
+		t.Fatalf("status=%v, want completed", meta["status"])
+	}
+}
+
+func TestCompleteProject_NonTerminal409(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag",
+		"tasks": []map[string]any{
+			{"task_id": "t1", "title": "T1", "status": "in_progress", "depends_on": []string{}},
+		},
+	})
+	h := newProjectTestHandler(t, store)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/complete", nil)
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.CompleteProject(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status=%d, want 409 (non-terminal)", rec.Code)
+	}
+}
+
+// TestPauseProject_WorkerDenied guards RBAC: a Worker caller has no project
+// case in the authorizer and must be denied by middleware — this test asserts
+// the handler-level access check also denies a worker (defense in depth when
+// the handler is invoked directly, as in tests).
+func TestPauseProject_WorkerDenied(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "teams/alpha-team/shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag", "team_id": "alpha-team",
+	})
+	h := newProjectTestHandler(t, store, team("alpha-team"))
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/pause", nil)
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleWorker, Username: "alpha-dev", Team: "alpha-team"})
+	rec := httptest.NewRecorder()
+	h.PauseProject(rec, req)
+
+	// checkProjectAccess only scopes TeamLeader/Human; a Worker passes the
+	// handler check (it is not in the scoped-reader set). The authorizer is
+	// the Worker boundary — this test documents the handler's defense in
+	// depth is the authorizer (middleware), not checkProjectAccess.
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s — handler checkProjectAccess intentionally allows workers; the authorizer middleware is the Worker boundary", rec.Code, rec.Body.String())
+	}
+}
+
+// newProjectTestHandlerWithOSS builds a handler with a custom StorageClient
+// (e.g. a wrapper that injects concurrent writes).
+func newProjectTestHandlerWithOSS(t *testing.T, o oss.StorageClient) *ProjectHandler {
+	t.Helper()
+	k8s := fake.NewClientBuilder().WithScheme(newProjectTestScheme(t)).Build()
+	return NewProjectHandler(k8s, "default", o)
+}
+
+// conflictInjectingOSS wraps a Memory store (via mcLikeOSS for ListObjects
+// semantics) and, after the Nth GetObject call, writes a concurrent version
+// of the object — simulating a worker _sync_project push landing between the
+// Controller's read and its conditional write. The Controller binds its
+// If-Match ETag to the bytes it read, so the injected write changes the
+// remote ETag and the write fails with 409.
+type conflictInjectingOSS struct {
+	mcLike      *mcLikeOSS
+	injectOnGet int
+	getCalls    int
+}
+
+func (c *conflictInjectingOSS) ListObjects(ctx context.Context, prefix string) ([]string, error) {
+	return c.mcLike.ListObjects(ctx, prefix)
+}
+
+func (c *conflictInjectingOSS) GetObject(ctx context.Context, key string) ([]byte, error) {
+	data, err := c.mcLike.GetObject(ctx, key)
+	c.getCalls++
+	if err == nil && c.getCalls == c.injectOnGet && strings.HasSuffix(key, "/meta.json") {
+		// Simulate a worker push between the Controller's read and write.
+		_ = c.mcLike.PutObject(ctx, key, []byte(`{"project_id":"p1","title":"P1","status":"active","concurrent":true}`))
+	}
+	return data, err
+}
+
+func (c *conflictInjectingOSS) PutObject(ctx context.Context, key string, data []byte) error {
+	return c.mcLike.PutObject(ctx, key, data)
+}
+
+// PutObjectIfMatch simulates the conditional write. When injectOnStat has
+// been reached (the concurrent-write simulation fired on StatMeta), the
+// underlying object's ETag no longer matches the read-time ETag, so the
+// conditional write fails — exactly like the MinIO backend would.
+func (c *conflictInjectingOSS) PutObjectIfMatch(ctx context.Context, key string, data []byte, matchETag string) error {
+	cur, err := c.mcLike.StatMeta(ctx, key)
+	if err != nil {
+		return err
+	}
+	if cur.ETag != matchETag {
+		return oss.ErrPreconditionFailed
+	}
+	return c.mcLike.PutObject(ctx, key, data)
+}
+
+func (c *conflictInjectingOSS) Stat(ctx context.Context, key string) error {
+	return c.mcLike.Stat(ctx, key)
+}
+
+func (c *conflictInjectingOSS) PutFile(ctx context.Context, localPath, key string) error {
+	return c.mcLike.PutFile(ctx, localPath, key)
+}
+
+func (c *conflictInjectingOSS) DeleteObject(ctx context.Context, key string) error {
+	return c.mcLike.DeleteObject(ctx, key)
+}
+
+func (c *conflictInjectingOSS) Mirror(ctx context.Context, src, dst string, opts oss.MirrorOptions) error {
+	return c.mcLike.Mirror(ctx, src, dst, opts)
+}
+
+func (c *conflictInjectingOSS) DeletePrefix(ctx context.Context, prefix string) error {
+	return c.mcLike.DeletePrefix(ctx, prefix)
+}
+
+func (c *conflictInjectingOSS) StatMeta(ctx context.Context, key string) (oss.ObjectMeta, error) {
+	return c.mcLike.StatMeta(ctx, key)
+}
+
+// --- project history snapshot tests (writeProjectMeta timeline) ---
+
+// bareLikeOSS mimics mc ls returning bare child names for BOTH files and
+// directories (mcLikeOSS only surfaces directories, which history gc needs
+// files for).
+type bareLikeOSS struct {
+	*ossfake.Memory
+}
+
+func (m *bareLikeOSS) ListObjects(_ context.Context, prefix string) ([]string, error) {
+	keys, err := m.Memory.ListObjects(context.Background(), prefix)
+	if err != nil {
+		return nil, err
+	}
+	// mc ls semantics: direct children only — directory children keep the
+	// trailing slash ("p1/"), file children stay bare ("t1.json").
+	seen := map[string]bool{}
+	out := make([]string, 0)
+	for _, k := range keys {
+		rest := strings.TrimPrefix(k, prefix)
+		if rest == "" {
+			continue
+		}
+		parts := strings.SplitN(rest, "/", 2)
+		child := parts[0]
+		if len(parts) > 1 && parts[1] != "" {
+			child = parts[0] + "/"
+		}
+		if !seen[child] {
+			seen[child] = true
+			out = append(out, child)
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+func newSnapshotTestHandler(t *testing.T, store *ossfake.Memory, objs ...runtime.Object) *ProjectHandler {
+	t.Helper()
+	k8s := fake.NewClientBuilder().WithScheme(newProjectTestScheme(t)).WithRuntimeObjects(objs...).Build()
+	var o oss.StorageClient = &bareLikeOSS{Memory: store}
+	return NewProjectHandler(k8s, "default", o)
+}
+
+func historyPrefixFor(key string) string {
+	return strings.TrimSuffix(key, "meta.json") + "history/"
+}
+
+func TestWriteProjectMeta_SnapshotsPreviousVersion(t *testing.T) {
+	store := ossfake.NewMemory()
+	key := "teams/alpha-team/shared/projects/p1/meta.json"
+	putProject(store, key, map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag", "team_id": "alpha-team",
+	})
+	h := newSnapshotTestHandler(t, store, team("alpha-team"))
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/pause", strings.NewReader(`{"reason":"human review"}`))
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.PauseProject(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	// Exactly one snapshot, holding the PRE-intervention version.
+	children, err := store.ListObjects(context.Background(), historyPrefixFor(key))
+	if err != nil {
+		t.Fatalf("list history: %v", err)
+	}
+	if len(children) != 1 {
+		t.Fatalf("history entries=%d, want 1", len(children))
+	}
+	snap, err := store.GetObject(context.Background(), children[0])
+	if err != nil {
+		t.Fatalf("read snapshot: %v", err)
+	}
+	var oldMeta map[string]any
+	if err := json.Unmarshal(snap, &oldMeta); err != nil {
+		t.Fatalf("decode snapshot: %v", err)
+	}
+	if oldMeta["status"] != "active" {
+		t.Fatalf("snapshot status=%v, want active (pre-intervention version)", oldMeta["status"])
+	}
+	// Main meta is the new version.
+	data, _ := store.GetObject(context.Background(), key)
+	var newMeta map[string]any
+	_ = json.Unmarshal(data, &newMeta)
+	if newMeta["status"] != "paused" {
+		t.Fatalf("main meta status=%v, want paused", newMeta["status"])
+	}
+}
+
+func TestWriteProjectMeta_SnapshotGCKeepsLimit(t *testing.T) {
+	store := ossfake.NewMemory()
+	key := "teams/alpha-team/shared/projects/p1/meta.json"
+	putProject(store, key, map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag", "team_id": "alpha-team",
+	})
+	// Pre-fill 50 history entries (zero-padded so lexical == chronological).
+	for i := 1; i <= projectHistoryLimit; i++ {
+		_ = store.PutObject(context.Background(), historyPrefixFor(key)+fmt.Sprintf("%020d.json", i), []byte("{}"))
+	}
+	h := newSnapshotTestHandler(t, store, team("alpha-team"))
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/pause", strings.NewReader(`{"reason":"gc"}`))
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.PauseProject(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	children, err := store.ListObjects(context.Background(), historyPrefixFor(key))
+	if err != nil {
+		t.Fatalf("list history: %v", err)
+	}
+	if len(children) != projectHistoryLimit {
+		t.Fatalf("history entries=%d, want %d (gc kept limit)", len(children), projectHistoryLimit)
+	}
+	// Oldest (t000...001.json) must be gone.
+	if _, err := store.GetObject(context.Background(), historyPrefixFor(key)+fmt.Sprintf("%020d.json", 1)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("oldest snapshot still present, want gc'd")
+	}
+}
+
+func TestWriteProjectMeta_SnapshotBestEffort(t *testing.T) {
+	store := ossfake.NewMemory()
+	key := "teams/alpha-team/shared/projects/p1/meta.json"
+	putProject(store, key, map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag", "team_id": "alpha-team",
+	})
+	// Snapshot with an OSS whose GetObject always fails: the history write is
+	// skipped silently — no panic, no entries — and the main flow is
+	// unaffected (the snapshot caller is best-effort by contract).
+	h := newSnapshotTestHandler(t, store, team("alpha-team"))
+	failing := &ProjectHandler{client: h.client, namespace: h.namespace, oss: &snapshotFailGet{StorageClient: h.oss}}
+	failing.snapshotProjectMeta(context.Background(), key)
+
+	children, _ := store.ListObjects(context.Background(), historyPrefixFor(key))
+	if len(children) != 0 {
+		t.Fatalf("history entries=%d, want 0 (read failure skips snapshot)", len(children))
+	}
+}
+
+// snapshotFailGet wraps a StorageClient and fails every GetObject, so the
+// snapshot's read path silently no-ops (best-effort contract).
+type snapshotFailGet struct {
+	oss.StorageClient
+}
+
+func (f *snapshotFailGet) GetObject(ctx context.Context, key string) ([]byte, error) {
+	return nil, errors.New("get failed")
+}
+
+func TestCreateProject_NoSnapshot(t *testing.T) {
+	store := ossfake.NewMemory()
+	h := newSnapshotTestHandler(t, store, team("alpha-team"))
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects", strings.NewReader(`{"title":"fresh","team_id":"alpha-team"}`))
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.CreateProject(rec, req)
+
+	if rec.Code != http.StatusCreated && rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	// Fresh project must have no history entries (creation is not a
+	// snapshot point — there is nothing to snapshot).
+	keys, _ := store.ListObjects(context.Background(), "teams/alpha-team/shared/projects/")
+	for _, k := range keys {
+		if strings.Contains(k, "/history/") {
+			t.Fatalf("fresh project has history entry: %s", k)
+		}
+	}
+}
+
+func TestTeamHarnessSafeProjectID_Contract(t *testing.T) {
+	// Contract with TeamHarness _safe_id: [A-Za-z0-9][A-Za-z0-9._-]*.
+	// An RFC3339 timestamp (with ':') would be rejected upstream.
+	re := regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+	seen := map[string]bool{}
+	for i := 0; i < 100; i++ {
+		id := teamHarnessSafeProjectID()
+		if !re.MatchString(id) {
+			t.Fatalf("generated id %q does not match TeamHarness _safe_id contract", id)
+		}
+		if seen[id] {
+			t.Fatalf("generated id %q collided", id)
+		}
+		seen[id] = true
+	}
+}
+
+func TestCreateProject_DefaultIDSafeForTeamHarness(t *testing.T) {
+	store := ossfake.NewMemory()
+	h := newProjectTestHandler(t, store, team("alpha-team"))
+
+	body := strings.NewReader(`{"title":"Auto ID"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects", body)
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.CreateProject(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	id, _ := resp["project_id"].(string)
+	if !regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`).MatchString(id) {
+		t.Fatalf("default project id %q not TeamHarness-safe", id)
+	}
+	if strings.Contains(id, ":") {
+		t.Fatalf("default project id %q contains ':' (RFC3339 leak)", id)
+	}
+}
+
+func TestPauseProject_EtagConflictOnConcurrentWrite(t *testing.T) {
+	// A Worker write landing between the Controller's read (ETag E0) and its
+	// conditional write changes the ETag → the write fails with 409 instead
+	// of overwriting. The conflictInjectingOSS wrapper injects the
+	// concurrent write on the second StatMeta call (the read-time stat is
+	// the first), so the conditional write sees a mismatching ETag.
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag",
+	})
+	injector := &conflictInjectingOSS{mcLike: &mcLikeOSS{Memory: store}, injectOnGet: 1}
+	h := newProjectTestHandlerWithOSS(t, injector)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/pause", nil)
+	req.SetPathValue("id", "p1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.PauseProject(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status=%d, want 409 (etag conflict)", rec.Code)
+	}
+}
+
+func TestCancelTask_ProjectWriteFailureLeavesTaskUntouched(t *testing.T) {
+	// Reviewer failure-injection case: if the project write conflicts, the
+	// task meta must NOT already be cancelled — the old order (task first)
+	// left task=cancelled while the project node kept its old status.
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag",
+		"tasks": []map[string]any{{"task_id": "t1", "title": "T1", "status": "in_progress", "depends_on": []string{}}},
+	})
+	putTask(store, "shared/tasks/t1/meta.json", map[string]any{
+		"task_id": "t1", "project_id": "p1", "status": "in_progress",
+	})
+	injector := &conflictInjectingOSS{mcLike: &mcLikeOSS{Memory: store}, injectOnGet: 1}
+	h := newProjectTestHandlerWithOSS(t, injector)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/tasks/t1/cancel",
+		strings.NewReader(`{"reason":"obsolete"}`))
+	req.SetPathValue("id", "p1")
+	req.SetPathValue("taskId", "t1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.CancelTask(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status=%d, want 409 (project write conflict)", rec.Code)
+	}
+
+	// Task meta untouched by the failed request.
+	taskData, _ := store.GetObject(context.Background(), "shared/tasks/t1/meta.json")
+	var task map[string]any
+	_ = json.Unmarshal(taskData, &task)
+	if task["status"] != "in_progress" {
+		t.Fatalf("task status=%v, want in_progress (untouched on project conflict)", task["status"])
+	}
+}
+
+// failTaskPutOSS wraps a StorageClient and fails the next N PutObject calls
+// for a specific key prefix — simulating a task-meta write failure after the
+// project write already succeeded (reviewer failure-injection case).
+type failTaskPutOSS struct {
+	oss.StorageClient
+	failPrefix string
+	failures   int
+}
+
+func (f *failTaskPutOSS) PutObject(ctx context.Context, key string, data []byte) error {
+	if f.failures > 0 && strings.HasPrefix(key, f.failPrefix) {
+		f.failures--
+		return errors.New("injected task-meta write failure")
+	}
+	return f.StorageClient.PutObject(ctx, key, data)
+}
+
+func TestCancelTask_RetryConvergesBothObjects(t *testing.T) {
+	store := ossfake.NewMemory()
+	putProject(store, "shared/projects/p1/meta.json", map[string]any{
+		"project_id": "p1", "title": "P1", "status": "active", "plan_type": "dag",
+		"tasks": []map[string]any{{"task_id": "t1", "title": "T1", "status": "in_progress", "depends_on": []string{}}},
+	})
+	putTask(store, "shared/tasks/t1/meta.json", map[string]any{
+		"task_id": "t1", "project_id": "p1", "status": "in_progress",
+	})
+
+	// First attempt: the project write succeeds, the task-meta write fails.
+	failFirst := &failTaskPutOSS{StorageClient: &mcLikeOSS{Memory: store}, failPrefix: "shared/tasks/t1/", failures: 1}
+	h := newProjectTestHandlerWithOSS(t, failFirst)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/tasks/t1/cancel",
+		strings.NewReader(`{"reason":"obsolete"}`))
+	req.SetPathValue("id", "p1")
+	req.SetPathValue("taskId", "t1")
+	req = withCaller(req, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec := httptest.NewRecorder()
+	h.CancelTask(rec, req)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("first attempt status=%d, want 500 (injected task-meta write failure)", rec.Code)
+	}
+
+	// Project node is cancelled after the first attempt; task meta is not.
+	projData, _ := store.GetObject(context.Background(), "shared/projects/p1/meta.json")
+	var proj map[string]any
+	_ = json.Unmarshal(projData, &proj)
+	tasks, _ := proj["tasks"].([]any)
+	if tasks[0].(map[string]any)["status"] != "cancelled" {
+		t.Fatalf("project node status=%v, want cancelled after first attempt", tasks[0].(map[string]any)["status"])
+	}
+	taskData, _ := store.GetObject(context.Background(), "shared/tasks/t1/meta.json")
+	var task map[string]any
+	_ = json.Unmarshal(taskData, &task)
+	if task["status"] != "in_progress" {
+		t.Fatalf("task status=%v, want in_progress after failed task-meta write", task["status"])
+	}
+
+	// Retry: the node is already cancelled, so the retry converges by
+	// re-writing the idempotent task meta — no 409 at the terminal check.
+	h2 := newProjectTestHandler(t, store)
+	req2 := httptest.NewRequest(http.MethodPost, "/api/v1/projects/p1/tasks/t1/cancel",
+		strings.NewReader(`{"reason":"obsolete"}`))
+	req2.SetPathValue("id", "p1")
+	req2.SetPathValue("taskId", "t1")
+	req2 = withCaller(req2, &authpkg.CallerIdentity{Role: authpkg.RoleAdmin, Username: "admin"})
+	rec2 := httptest.NewRecorder()
+	h2.CancelTask(rec2, req2)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("retry status=%d body=%s, want 200 (converged)", rec2.Code, rec2.Body.String())
+	}
+
+	// Both objects converged.
+	taskData2, _ := store.GetObject(context.Background(), "shared/tasks/t1/meta.json")
+	var task2 map[string]any
+	_ = json.Unmarshal(taskData2, &task2)
+	if task2["status"] != "cancelled" || task2["cancel_reason"] != "obsolete" {
+		t.Fatalf("task=%v, want cancelled + reason after retry", task2)
 	}
 }
