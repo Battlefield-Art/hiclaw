@@ -14,6 +14,8 @@ When the delegating agent (Manager / Leader / 获授权 Worker) assigns you a ta
 4. Delegate execution to the delegating agent's CLI tool
 5. Review the result
 
+**Operational reference**: [`references/delegation-guidance.md`](references/delegation-guidance.md) — one-shot delegation from the delegator's side: what it is, task-spec discipline, what it does not provide, and where results and logs land. Later capabilities (supervision, steering, approval) are documented in the management-side guidance.
+
 ---
 
 ## When to Use This Skill
