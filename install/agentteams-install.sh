@@ -43,6 +43,12 @@
 #   AGENTTEAMS_NACOS_USERNAME              Default Nacos username for nacos:// package imports (optional)
 #   AGENTTEAMS_NACOS_PASSWORD              Default Nacos password for nacos:// package imports (optional)
 #   AGENTTEAMS_CMS_TRACES_ENABLED          Enable openclaw-cms-plugin traces for Manager AND all Workers (default: false)
+#                                         (Plugin is still distributed as `openclaw-cms-plugin` — downloaded by
+#                                          manager/Dockerfile and worker/Dockerfile from OPENCLAW_CMS_PLUGIN_URL
+#                                          and referenced as `CMS_PLUGIN_NAME=openclaw-cms-plugin` in
+#                                          manager/scripts/init/start-manager-agent.sh. The env-var family was
+#                                          intentionally renamed `AGENTTEAMS_CMS_*`; the plugin package name
+#                                          is what the Dockerfiles / start-manager-agent.sh still use.)
 #   AGENTTEAMS_CMS_ENDPOINT                ARMS OTLP endpoint (required if traces enabled)
 #   AGENTTEAMS_CMS_LICENSE_KEY             CMS license key (required if traces enabled)
 #   AGENTTEAMS_CMS_PROJECT                 CMS project name (optional)
@@ -3945,9 +3951,12 @@ EOF
 
     # Matrix-plugin debug tracing: pass through if AGENTTEAMS_MATRIX_DEBUG=1.
     # The container entrypoints translate this to OPENCLAW_MATRIX_DEBUG=1
-    # so the openclaw matrix plugin emits structured INFO-level lifecycle
-    # traces (sync state transitions, room.invite/join, message handler
-    # arrival + filter outcomes). Used to diagnose worker/manager hangs.
+    # so the AgentTeams matrix plugin (the legacy env-var name is kept
+    # for the worker-entrypoint's backward-compat shim — see
+    # worker/scripts/worker-entrypoint.sh:316) emits structured
+    # INFO-level lifecycle traces (sync state transitions,
+    # room.invite/join, message handler arrival + filter outcomes).
+    # Used to diagnose worker/manager hangs.
     MATRIX_DEBUG_ARGS=""
     if [ "${AGENTTEAMS_MATRIX_DEBUG:-}" = "1" ]; then
         MATRIX_DEBUG_ARGS="-e AGENTTEAMS_MATRIX_DEBUG=1"
