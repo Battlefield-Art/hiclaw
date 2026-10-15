@@ -814,5 +814,43 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Install the checker's version-parsing dependency
+        # The pre-flight checker imports `packaging` (version comparison); a
+        # bare setup-python runner does not ship it, so install it before the
+        # offline suite runs.
+        run: python3 -m pip install --quiet packaging
+
       - name: Run the offline pre-flight suite
         run: python3 qwenpaw/tests/test_check_qwenpaw_upgrade.py
+
+# ============================================================
+# In-place upgrade orchestrator battery (AgentTeams#1341 lifecycle S3-S6)
+# Fully stubbed (--selftest): no Docker, no network, no package changes.
+# ============================================================
+
+  qwenpaw-runtime-upgrade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run the in-place upgrade battery (stubbed selftest)
+        run: bash qwenpaw/scripts/upgrade_qwenpaw_runtime.sh --selftest
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install the upgrade test-suite dependencies
+        # The plugin tests load the real plugin module (fastapi/pydantic);
+        # the version tests use packaging for PEP440 comparison.
+        run: python3 -m pip install --quiet pytest packaging fastapi pydantic
+
+      - name: Run the upgrade pytest battery (orchestrator / versions / plugin / entrypoint)
+        # Fully stubbed: fake orchestrator hooks, fake worker, no network.
+        run: >
+          python3 -m pytest -q
+          qwenpaw/tests/test_upgrade_orchestrator.py
+          qwenpaw/tests/test_upgrade_versions.py
+          qwenpaw/tests/test_upgrade_plugin.py
+          qwenpaw/tests/test_upgrade_entrypoint.py
