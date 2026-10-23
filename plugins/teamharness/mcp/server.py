@@ -4831,6 +4831,7 @@ _SIGNAL_EMITTERS: dict[str, tuple[str, str, str]] = {
     "accept_task_result": ("task_accepted", "SIG-COMPLETE", "submit"),
     "record_loop_iteration": ("loop_iteration_finished", "SIG-DECISION", "decision_lock"),
     "record_loop_iteration:review": ("loop_review_verdict", "SIG-VERDICT", "critic_verdict"),
+    "illegal_transition_rejected": ("mismatch_recorded", "SIG-MISMATCH", "mismatch_recorded"),
 }
 
 
@@ -4845,6 +4846,7 @@ def _signal_event_id(
     fingerprint: str,
     attempt: int = 0,
     audit_seq: int = 0,
+    discriminator: str = "",
 ) -> str:
     # Contract id_rule (v1.2): 'ev_' + sha256(team_id|project_id|task_id|
     # loop_id|event_type|source_event|iteration|fingerprint|attempt|
@@ -4858,20 +4860,31 @@ def _signal_event_id(
     # + same state bytes) re-lands on the same id (consumer dedupes).
     # Must stay byte-identical to the Go signalEventID (both test suites
     # pin the same fixed vector).
-    digest = hashlib.sha256(
-        "|".join([
-            team_id,
-            project_id,
-            task_id,
-            loop_id,
-            event_type,
-            source_event,
-            str(iteration) if iteration is not None else "",
-            fingerprint,
-            str(attempt),
-            str(audit_seq),
-        ]).encode("utf-8")
-    ).hexdigest()
+    #
+    # Rejection events (SIG-MISMATCH) append an extra final component: a
+    # rejection commits no state, so the ref bytes — and therefore the
+    # fingerprint — are identical across *different* rejected operations
+    # on the same task state. The rejection discriminator
+    # ``action|from|to`` is the logical-operation identity for this
+    # family: appending it keeps distinct rejections on distinct ids
+    # while a retry of the same rejection re-hashes identically. Events
+    # without a discriminator hash the fixed ten-field v1.2 input
+    # unchanged (the cross-language fixed vector is untouched).
+    parts = [
+        team_id,
+        project_id,
+        task_id,
+        loop_id,
+        event_type,
+        source_event,
+        str(iteration) if iteration is not None else "",
+        fingerprint,
+        str(attempt),
+        str(audit_seq),
+    ]
+    if discriminator:
+        parts.append(discriminator)
+    digest = hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
     return "ev_" + digest[:16]
 
 
@@ -4908,6 +4921,7 @@ def _emit_signal_event(
     ref_bytes: bytes = b"",
     payload: dict[str, Any] | None = None,
     audit_seq: int = 0,
+    discriminator: str = "",
 ) -> bool:
     """Append one S2 signal event object under shared/events/{team_id}/.
 
@@ -4922,6 +4936,12 @@ def _emit_signal_event(
     committed-operation revision — the operation instance identity that
     distinguishes two operations whose post-write state bytes would
     otherwise be identical; 0 when the project carries none.
+
+    discriminator (contract id_rule v1.2, rejection family): a rejection
+    commits no state, so the ref bytes do not differ between distinct
+    rejected operations. The ``action|from|to`` discriminator is appended
+    to the identity so distinct rejections get distinct ids while a retry
+    of the same rejection stays idempotent.
     """
     try:
         source_event, event_type, origin = _SIGNAL_EMITTERS[emitter]
@@ -4944,6 +4964,7 @@ def _emit_signal_event(
             fingerprint,
             0,
             audit_seq,
+            discriminator,
         )
         path = _workspace_dir(arguments) / "shared" / "events" / team_id / f"{event_id}.json"
         if path.exists():
@@ -5070,10 +5091,34 @@ def _terminal_task_status(arguments: dict[str, Any], task: dict[str, Any], task_
     return task_status if task_status in TERMINAL_TASK_STATUSES else ""
 
 
-def _require_task_mutable(arguments: dict[str, Any], task: dict[str, Any], task_id: str, action: str) -> None:
+def _require_task_mutable(
+    arguments: dict[str, Any],
+    task: dict[str, Any],
+    task_id: str,
+    action: str,
+    to_status: str = "",
+) -> None:
+    """Terminal-state guard for taskflow actions.
+
+    Rejection uses the same structured surface as the table check
+    (IllegalTransitionError + SIG-MISMATCH) so the public taskflow entry
+    returns ``illegal_transition`` with from/to instead of a bare error
+    string.  ``to_status`` is the status the action would have written
+    ("" for status-preserving actions — the reported to equals from).
+    """
     terminal_status = _terminal_task_status(arguments, task, task_id)
     if terminal_status:
-        raise ValueError(f"{action} cannot update terminal task: {terminal_status}")
+        _reject_task_transition(
+            terminal_status,
+            to_status or terminal_status,
+            action,
+            (
+                f"{action} cannot update terminal task: {terminal_status} "
+                f"(task is in terminal state {terminal_status})"
+            ),
+            arguments=arguments,
+            task_id=task_id,
+        )
 
 
 def _update_project_task(arguments: dict[str, Any], project_id: str, task_id: str, **updates: Any) -> bool:
@@ -5119,21 +5164,110 @@ def _transition_guidance(action: str, from_status: str) -> str:
     return "check the task transition table (task-transitions.json)"
 
 
-def _assert_transition(from_status: str, to_status: str, action: str) -> None:
-    """Table check.  Same-state re-entry is a legal no-op (idempotent retry)."""
+class IllegalTransitionError(ValueError):
+    """Structured illegal-transition rejection (INT-5).
+
+    Carries the from/to/action triple so the taskflow dispatch layer can
+    return a structured error; a ValueError subclass so the internal
+    protocol (call sites, OSError-only inner catches) is unchanged.
+    """
+
+    def __init__(self, from_status: str, to_status: str, action: str, message: str) -> None:
+        super().__init__(message)
+        self.from_status = from_status
+        self.to_status = to_status
+        self.action = action
+
+
+def _assert_transition(
+    from_status: str,
+    to_status: str,
+    action: str,
+    *,
+    arguments: dict[str, Any] | None = None,
+    task_id: str = "",
+) -> None:
+    """Table check.  Same-state re-entry is a legal no-op (idempotent retry).
+
+    Rejections raise IllegalTransitionError with an ``illegal_transition:``
+    message; terminal states and unknown states get distinct messages.  When
+    ``arguments`` + ``task_id`` are provided the rejection also emits
+    SIG-MISMATCH (best-effort — ``_emit_signal_event`` never raises).
+    """
     if from_status == to_status:
         return
-    allowed = TRANSITIONS.get(from_status)
-    if allowed is None:
-        raise ValueError(
-            f"{action}: task is in unexpected state {from_status or 'missing'}; "
-            f"{_transition_guidance(action, from_status)}"
+    if from_status in TERMINAL_TASK_STATUSES:
+        message = (
+            f"illegal_transition: {action}: task is in terminal state {from_status} "
+            f"(immutable); cannot transition to '{to_status}'"
         )
-    if to_status not in allowed:
-        raise ValueError(
-            f"{action}: task is '{from_status}'; {_transition_guidance(action, from_status)} "
-            f"(allowed transitions from '{from_status}': {', '.join(allowed)})"
+    else:
+        allowed = TRANSITIONS.get(from_status)
+        if allowed is None:
+            message = (
+                f"illegal_transition: {action}: task is in unexpected state "
+                f"{from_status or 'missing'}; {_transition_guidance(action, from_status)}"
+            )
+        elif to_status not in allowed:
+            message = (
+                f"illegal_transition: {action}: task is '{from_status}'; "
+                f"{_transition_guidance(action, from_status)} "
+                f"(allowed transitions from '{from_status}': {', '.join(allowed)})"
+            )
+        else:
+            return
+    if arguments is not None and task_id:
+        _emit_signal_event(
+            arguments,
+            "illegal_transition_rejected",
+            task_id=task_id,
+            ref=f"shared/tasks/{task_id}/meta.json",
+            ref_bytes=_safe_read_bytes(_task_state_path(arguments, task_id)),
+            payload={
+                "from_status": from_status,
+                "to_status": to_status,
+                "action": action,
+            },
+            discriminator=f"{action}|{from_status}|{to_status}",
         )
+    raise IllegalTransitionError(from_status, to_status, action, message)
+
+
+def _reject_task_transition(
+    from_status: str,
+    to_status: str,
+    action: str,
+    message: str,
+    *,
+    arguments: dict[str, Any] | None = None,
+    task_id: str = "",
+) -> None:
+    """Action-level guard rejection (pre-``_transition_task`` checks:
+    terminal immutability, ack/submit/progress ordering, cancel).
+
+    Same structured surface as the table check: raises
+    IllegalTransitionError so the taskflow dispatch returns
+    ``illegal_transition`` with from/to, and emits SIG-MISMATCH when the
+    task is named.  The TRANSITIONS table itself is untouched — these
+    guards encode action-level rules stricter than the table (e.g. ack on
+    a planned task is rejected even though planned -> in_progress is a
+    legal table edge reached via delegate_task).
+    """
+    if arguments is not None and task_id:
+        _emit_signal_event(
+            arguments,
+            "illegal_transition_rejected",
+            task_id=task_id,
+            ref=f"shared/tasks/{task_id}/meta.json",
+            ref_bytes=_safe_read_bytes(_task_state_path(arguments, task_id)),
+            payload={
+                "from_status": from_status,
+                "to_status": to_status,
+                "action": action,
+            },
+            discriminator=f"{action}|{from_status}|{to_status}",
+        )
+    raise IllegalTransitionError(from_status, to_status, action, message)
 
 
 def _append_transition_history(
@@ -5207,7 +5341,7 @@ def _transition_task(
     Returns the previous task-meta status.
     """
     old_status = from_status if from_status is not None else str(task.get("status") or "")
-    _assert_transition(old_status, new_status, action)
+    _assert_transition(old_status, new_status, action, arguments=arguments, task_id=task_id)
     if extra:
         task.update(extra)
     _append_transition_history(task, old_status, new_status, action, _transition_actor(arguments), note)
@@ -5794,7 +5928,7 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
             _validate_assignment_room(project, room_id)
             _validate_task_redelegation(arguments, project, task_id, room_id)
             existing_task = _read_json(_task_state_path(arguments, task_id), {"project_id": project_id})
-            _require_task_mutable(arguments, existing_task, task_id, action)
+            _require_task_mutable(arguments, existing_task, task_id, action, to_status="assigned")
             assigned_to = str(payload.get("assignedTo") or payload.get("assigned_to") or "").strip()
             if not assigned_to:
                 tasks = project.get("tasks", []) if isinstance(project.get("tasks"), list) else []
@@ -6108,17 +6242,27 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
             task_id = _safe_id(payload.get("taskId") or payload.get("task_id"), "taskId")
             local_task = _read_json(_task_state_path(arguments, task_id))
             if local_task:
-                _require_task_mutable(arguments, local_task, task_id, action)
+                _require_task_mutable(arguments, local_task, task_id, action, to_status="in_progress")
             pulled = _pull_task(arguments, task_id)
             task = _load_task(arguments, task_id)
-            _require_task_mutable(arguments, task, task_id, action)
+            _require_task_mutable(arguments, task, task_id, action, to_status="in_progress")
             if task.get("status") != "submitted":
                 # Tightening: ack only makes sense after the assignment
                 # (planned/prepared/missing -> structured error, not a
                 # silent state jump).
                 _ack_from = str(task.get("status") or "")
                 if _ack_from not in ("assigned", "in_progress"):
-                    raise ValueError(f"ack_task: task is '{_ack_from}'; delegate_task it first")
+                    _reject_task_transition(
+                        _ack_from,
+                        "in_progress",
+                        "ack_task",
+                        (
+                            f"illegal_transition: ack_task: task is '{_ack_from}'; "
+                            "delegate_task it first"
+                        ),
+                        arguments=arguments,
+                        task_id=task_id,
+                    )
                 _transition_task(
                     arguments,
                     task,
@@ -6145,7 +6289,7 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError("submit_task requires worker or remote-member role")
             task_id = _safe_id(payload.get("taskId") or payload.get("task_id"), "taskId")
             task = _load_task(arguments, task_id)
-            _require_task_mutable(arguments, task, task_id, action)
+            _require_task_mutable(arguments, task, task_id, action, to_status="submitted")
             summary = str(payload.get("summary") or "")
             status = _validate_task_result_status(payload.get("status"))
             deliverables = payload.get("deliverables") or []
@@ -6282,7 +6426,17 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
             # Tightening: submission requires an acknowledged assignment.
             _submit_from = str(task.get("status") or "")
             if _submit_from not in ("assigned", "in_progress"):
-                raise ValueError(f"submit_task: task is '{_submit_from}'; ack_task it first")
+                _reject_task_transition(
+                    _submit_from,
+                    "submitted",
+                    "submit_task",
+                    (
+                        f"illegal_transition: submit_task: task is '{_submit_from}'; "
+                        "ack_task it first"
+                    ),
+                    arguments=arguments,
+                    task_id=task_id,
+                )
             task_dir = _task_dir(arguments, task_id)
             task_dir.mkdir(parents=True, exist_ok=True)
             submission_id = uuid.uuid4().hex
@@ -6413,8 +6567,16 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
             # Progress notes only exist while the task is actually in flight.
             _progress_from = str(task.get("status") or "")
             if _progress_from not in ("assigned", "in_progress"):
-                raise ValueError(
-                    f"report_progress: task is '{_progress_from}'; ack_task it first"
+                _reject_task_transition(
+                    _progress_from,
+                    _progress_from,
+                    "report_progress",
+                    (
+                        f"illegal_transition: report_progress: task is '{_progress_from}'; "
+                        "ack_task it first"
+                    ),
+                    arguments=arguments,
+                    task_id=task_id,
                 )
             note = str(payload.get("note") or "").strip()
             if not note:
@@ -6752,7 +6914,17 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                     return _sync_failure_result(result, "cancel_task")
                 return result
             if terminal_status:
-                raise ValueError(f"cannot cancel terminal task: {terminal_status}")
+                _reject_task_transition(
+                    terminal_status,
+                    "cancelled",
+                    "cancel_task",
+                    (
+                        f"cannot cancel terminal task: {terminal_status} "
+                        f"(task is in terminal state {terminal_status})"
+                    ),
+                    arguments=arguments,
+                    task_id=task_id,
+                )
 
             _resolve_task_continuation(task, "cancelled")
             if normalized_replacement_task_id:
@@ -6827,6 +6999,16 @@ def _taskflow(arguments: dict[str, Any]) -> dict[str, Any]:
                 "effective": effective,
                 "pulled": pulled,
             }
+    except IllegalTransitionError as exc:
+        return {
+            "ok": False,
+            "tool": "taskflow",
+            "action": action,
+            "error": "illegal_transition",
+            "from": exc.from_status,
+            "to": exc.to_status,
+            "detail": str(exc),
+        }
     except ValueError as exc:
         return {"ok": False, "tool": "taskflow", "action": action, "error": str(exc)}
 
