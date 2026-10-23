@@ -152,6 +152,14 @@ type workflowResponse struct {
 	UpdatedBy   string `json:"updated_by,omitempty"`
 	UpdatedAt   string `json:"updated_at,omitempty"`
 	PauseReason string `json:"pause_reason,omitempty"`
+
+	// INT-8: projection freshness. The view is computed on demand from the
+	// filesync mirror, so ProjectionAgeMs (now - newest mirror mtime among
+	// the objects actually read) is the observable for mirror lag (#1391).
+	// 0 means no anchor could be read (all stats failed); IsStale compares
+	// the age against env PROJECTION_STALE_MS (default 30000 ms).
+	ProjectionAgeMs int64 `json:"projection_age_ms"`
+	IsStale         bool  `json:"is_stale"`
 }
 
 // workflowValues is the current state summary (LangGraph StateSnapshot.values
@@ -727,10 +735,11 @@ func (h *ProjectHandler) GetProjectWorkflow(w http.ResponseWriter, r *http.Reque
 		writeK8sError(w, "get project workflow", err)
 		return
 	}
-	meta, team, ok := h.resolveSingleProject(w, matches)
+	match, ok := h.resolveSingleProjectMatch(w, matches)
 	if !ok {
 		return
 	}
+	meta, team := match.meta, match.team
 	// W4: hide project existence from scoped callers (L2 / team leader) who
 	// do not own this project. resolveProjectMeta scans all prefixes, so a
 	// cross-team project is found; returning 403 would let callers enumerate
@@ -745,11 +754,10 @@ func (h *ProjectHandler) GetProjectWorkflow(w http.ResponseWriter, r *http.Reque
 		httputil.WriteError(w, http.StatusForbidden, err.Error())
 		return
 	}
-
 	if format == "mermaid" {
 		// Pure rendering of the same snapshot (buildWorkflow); per-task
 		// TaskMeta is not needed, so includeTasks is ignored.
-		resp := h.buildWorkflow(meta, team, false)
+		resp := h.buildWorkflow(meta, team, false, time.Time{})
 		snap := workflow.Snapshot{Next: resp.Next}
 		snap.Nodes = make([]workflow.Node, len(resp.Nodes))
 		for i, n := range resp.Nodes {
@@ -769,13 +777,105 @@ func (h *ProjectHandler) GetProjectWorkflow(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	httputil.WriteJSON(w, http.StatusOK, h.buildWorkflow(meta, team, includeTasks))
+	// INT-8: freshness anchor bound to the snapshot actually read. The
+	// anchor stat samples the mirror AFTER the content read, so
+	// verifyProjectMetaSnapshot checks the object's current ETag against
+	// the read bytes (with one bounded re-read on mismatch) before the
+	// anchor — and anything derived from it, e.g. projection_age_ms — is
+	// used.
+	meta, mtime, servedETag, verified := h.verifyProjectMetaSnapshot(r.Context(), match)
+	resp := h.buildWorkflow(meta, team, includeTasks, mtime)
+	if r.URL.Query().Get("consistency") == "strong" {
+		// Close the bracket: the verifying stat only proves the snapshot
+		// was stable at its instant. When storage has moved on, one
+		// bounded re-read (verifyProjectMetaSnapshot) is attempted and the
+		// bracket checked once more. X-Consistency: strong is set only
+		// when a stat confirms storage still holds the exact bytes being
+		// served — a failed re-read or an advance racing the re-read
+		// serves the content at hand WITHOUT the claim.
+		strong := false
+		for i := 0; i < 2 && !strong && verified; i++ {
+			m2, serr := h.oss.StatMeta(r.Context(), match.key)
+			if serr != nil || m2.ETag != servedETag {
+				meta, mtime, servedETag, verified = h.verifyProjectMetaSnapshot(r.Context(), match)
+				resp = h.buildWorkflow(meta, team, includeTasks, mtime)
+				continue
+			}
+			strong = true
+		}
+		if strong {
+			w.Header().Set("X-Consistency", "strong")
+		}
+	}
+
+	httputil.WriteJSON(w, http.StatusOK, resp)
+}
+
+// verifyProjectMetaSnapshot binds the freshness anchor to the project meta
+// snapshot actually served.
+//
+// The anchor StatMeta samples the mirror AFTER resolveProjectMeta's
+// GetObject. A filesync mirror advance landing in between makes the anchor
+// describe a newer version than the bytes actually read — the round-2
+// advanceAt=1 repro: stale content served with a fresh anchor and, on the
+// ?consistency=strong path, an unverified X-Consistency: strong header.
+//
+// Binding the version token to the read itself: the object's current ETag
+// (content hash — MinIO single-part ETag == MD5 of content, as in the
+// in-memory fake) must equal the ETag computed from the bytes we read
+// (match.etag). When it does not, the held snapshot is superseded and one
+// bounded re-read is attempted under the same verification (the post-read
+// stat's ETag must equal the re-read bytes' own hash). A failed re-read, an
+// unparseable re-read, or an advance racing the re-read serves the content
+// at hand with NO anchor and verified=false: the response degrades rather
+// than claiming freshness it cannot prove — a failed re-read must never be
+// reported as strong. When a backend cannot report an ETag the held
+// snapshot is assumed current (no re-read), but callers must still obtain a
+// positive ETag match before claiming strong consistency.
+//
+// A stat error degrades to "no anchor" and never fails the request
+// (audit.go idiom).
+func (h *ProjectHandler) verifyProjectMetaSnapshot(ctx context.Context, match *projectMatch) (*projectMeta, time.Time, string, bool) {
+	m, serr := h.oss.StatMeta(ctx, match.key)
+	if serr != nil {
+		return match.meta, time.Time{}, match.etag, false
+	}
+	if m.ETag == "" || m.ETag == match.etag {
+		return match.meta, m.ModTime, match.etag, true
+	}
+	// The mirror advanced between the read and the anchor stat: the held
+	// snapshot is superseded. One bounded re-read, verified the same way.
+	data, gerr := h.oss.GetObject(ctx, match.key)
+	if gerr != nil {
+		return match.meta, time.Time{}, match.etag, false
+	}
+	var newMeta projectMeta
+	if uerr := json.Unmarshal(data, &newMeta); uerr != nil {
+		return match.meta, time.Time{}, match.etag, false
+	}
+	if newMeta.TeamID == "" {
+		newMeta.TeamID = match.team
+	}
+	reETag := contentETag(data)
+	m2, serr := h.oss.StatMeta(ctx, match.key)
+	if serr != nil {
+		return &newMeta, time.Time{}, reETag, false
+	}
+	if m2.ETag != "" && m2.ETag != reETag {
+		// An advance raced the re-read: serve the fresher re-read bytes,
+		// but no anchor can be bound to them.
+		return &newMeta, time.Time{}, reETag, false
+	}
+	return &newMeta, m2.ModTime, reETag, true
 }
 
 // buildWorkflow converts project meta into the LangGraph-aligned response.
 // When includeTasks is true it additionally reads per-task TaskMeta from
-// shared storage and attaches tasks_detail.
-func (h *ProjectHandler) buildWorkflow(meta *projectMeta, team string, includeTasks bool) *workflowResponse {
+// shared storage and attaches tasks_detail. projectMtime is the StatMeta
+// mtime of the project meta object backing this read (zero time = no
+// anchor); together with the newest task-meta mtime it drives the
+// projection_age_ms / is_stale response fields.
+func (h *ProjectHandler) buildWorkflow(meta *projectMeta, team string, includeTasks bool, projectMtime time.Time) *workflowResponse {
 	nodes := make([]workflowNode, 0, len(meta.Tasks))
 	edges := make([]workflowEdge, 0)
 	next := make([]string, 0)
@@ -880,9 +980,14 @@ func (h *ProjectHandler) buildWorkflow(meta *projectMeta, team string, includeTa
 	// authoritative); per-task read errors are skipped too so one bad task
 	// does not fail the whole workflow response.
 	var tasksDetail []taskDetail
+	var taskMaxMtime time.Time
 	if includeTasks {
-		tasksDetail = h.readTasksDetail(meta, team)
+		tasksDetail, taskMaxMtime = h.readTasksDetail(meta, team)
 	}
+
+	// INT-8: freshness from the mirror mtimes of the objects this view used
+	// (project meta always; task metas when includeTasks).
+	ageMs, isStale := projectionFreshness(projectMtime, taskMaxMtime)
 
 	return &workflowResponse{
 		ProjectID:  meta.ProjectID,
@@ -914,6 +1019,8 @@ func (h *ProjectHandler) buildWorkflow(meta *projectMeta, team string, includeTa
 		UpdatedBy:       meta.UpdatedBy,
 		UpdatedAt:       meta.UpdatedAt,
 		PauseReason:     meta.PauseReason,
+		ProjectionAgeMs: ageMs,
+		IsStale:         isStale,
 	}
 }
 
@@ -925,7 +1032,7 @@ func (h *ProjectHandler) buildWorkflow(meta *projectMeta, team string, includeTa
 // shared/tasks/{id}/meta.json for standalone projects. Reads are concurrent
 // (W7 pattern) so N tasks cost ~ceil(N/8) storage rounds instead of N serial
 // reads.
-func (h *ProjectHandler) readTasksDetail(meta *projectMeta, team string) []taskDetail {
+func (h *ProjectHandler) readTasksDetail(meta *projectMeta, team string) ([]taskDetail, time.Time) {
 	// Collect unique task ids from the graph (project tasks, or loop tasks
 	// for loop plans — same set buildWorkflow renders).
 	graphTasks := meta.Tasks
@@ -942,7 +1049,7 @@ func (h *ProjectHandler) readTasksDetail(meta *projectMeta, team string) []taskD
 		taskIDs = append(taskIDs, t.TaskID)
 	}
 	if len(taskIDs) == 0 {
-		return nil
+		return nil, time.Time{}
 	}
 
 	// Candidate TaskMeta keys: the project's owning scope ONLY, via
@@ -983,6 +1090,7 @@ func (h *ProjectHandler) readTasksDetail(meta *projectMeta, team string) []taskD
 	// because it is listed first; a task published to the global prefix is a
 	// fallback for standalone projects).
 	detailByTask := make(map[string]taskDetail, len(taskIDs))
+	winningKeys := make(map[string]bool, len(taskIDs))
 	for _, res := range results {
 		if len(res.data) == 0 {
 			continue
@@ -1021,6 +1129,7 @@ func (h *ProjectHandler) readTasksDetail(meta *projectMeta, team string) []taskD
 		}
 		detail.History = parseTaskHistory(raw["history"])
 		detailByTask[res.taskID] = detail
+		winningKeys[res.key] = true
 	}
 
 	// Return in graph order for stable output.
@@ -1030,7 +1139,48 @@ func (h *ProjectHandler) readTasksDetail(meta *projectMeta, team string) []taskD
 			out = append(out, d)
 		}
 	}
-	return out
+
+	// INT-8: freshness anchors — best-effort StatMeta on every task meta the
+	// detail actually came from (sequential after the concurrent GetObject
+	// phase; stat errors degrade to the remaining anchors, never fail the
+	// read).
+	var maxMtime time.Time
+	for key := range winningKeys {
+		if m, err := h.oss.StatMeta(context.Background(), key); err == nil && m.ModTime.After(maxMtime) {
+			maxMtime = m.ModTime
+		}
+	}
+	return out, maxMtime
+}
+
+// projectionFreshness derives the workflow response freshness fields from
+// the mirror mtimes of the objects the view was computed from: the newest
+// anchor wins, age is clamped at zero (clock-skew safe), and zero anchors
+// (every stat failed) degrade to (0, false).
+func projectionFreshness(anchors ...time.Time) (int64, bool) {
+	var newest time.Time
+	for _, a := range anchors {
+		if a.After(newest) {
+			newest = a
+		}
+	}
+	if newest.IsZero() {
+		return 0, false
+	}
+	age := time.Since(newest).Milliseconds()
+	if age < 0 {
+		age = 0
+	}
+	return age, age > staleThresholdMs()
+}
+
+// staleThresholdMs reads PROJECTION_STALE_MS (milliseconds); an invalid or
+// non-positive value falls back to the 30s default.
+func staleThresholdMs() int64 {
+	if v, err := strconv.Atoi(os.Getenv("PROJECTION_STALE_MS")); err == nil && v > 0 {
+		return int64(v)
+	}
+	return 30000
 }
 
 // keyForTaskID maps a candidate key back to the task id by extracting the
@@ -2847,7 +2997,7 @@ func (h *ProjectHandler) PauseProject(w http.ResponseWriter, r *http.Request) {
 		"actor":      authzActor(caller),
 	}, meta.AuditSeq)
 	h.interventionNotify(r.Context(), meta, fmt.Sprintf("⏸️ 项目 %s 已被暂停%s", meta.ProjectID, pauseReasonSuffix(reqBody.Reason)))
-	httputil.WriteJSON(w, http.StatusOK, h.buildWorkflow(meta, pwc.team, false))
+	httputil.WriteJSON(w, http.StatusOK, h.buildWorkflow(meta, pwc.team, false, time.Time{}))
 }
 
 // ResumeProject sets a paused project back to active.
@@ -2874,7 +3024,7 @@ func (h *ProjectHandler) ResumeProject(w http.ResponseWriter, r *http.Request) {
 		"actor":      authzActor(caller),
 	}, meta.AuditSeq)
 	h.interventionNotify(r.Context(), meta, fmt.Sprintf("▶️ 项目 %s 已恢复", meta.ProjectID))
-	httputil.WriteJSON(w, http.StatusOK, h.buildWorkflow(meta, pwc.team, false))
+	httputil.WriteJSON(w, http.StatusOK, h.buildWorkflow(meta, pwc.team, false, time.Time{}))
 }
 
 // pauseReasonSuffix formats an optional pause reason for the notification.
@@ -2970,7 +3120,7 @@ func (h *ProjectHandler) ReplanProject(w http.ResponseWriter, r *http.Request) {
 		"actor":       authzActor(caller),
 	}, meta.AuditSeq)
 	h.interventionNotify(r.Context(), meta, fmt.Sprintf("📋 项目 %s 已重规划（%d 个任务）", meta.ProjectID, len(planned)))
-	httputil.WriteJSON(w, http.StatusOK, h.buildWorkflow(meta, pwc.team, false))
+	httputil.WriteJSON(w, http.StatusOK, h.buildWorkflow(meta, pwc.team, false, time.Time{}))
 }
 
 // isSafeTaskID mirrors TeamHarness _safe_id ([A-Za-z0-9][A-Za-z0-9._-]*).
@@ -3298,7 +3448,7 @@ func (h *ProjectHandler) CancelTask(w http.ResponseWriter, r *http.Request) {
 		strings.TrimSpace(persistedCancelledAt) != "" &&
 		(!hasContinuation || (continuationStatus == "resolved" && continuationResolution == "cancelled"))
 	if fullyResolved {
-		httputil.WriteJSON(w, http.StatusOK, h.buildWorkflow(meta, team, false))
+		httputil.WriteJSON(w, http.StatusOK, h.buildWorkflow(meta, team, false, time.Time{}))
 		return
 	}
 	taskData["status"] = "cancelled"
@@ -3406,7 +3556,7 @@ func (h *ProjectHandler) CancelTask(w http.ResponseWriter, r *http.Request) {
 		"actor":      authzActor(caller),
 	}, meta.AuditSeq)
 	h.interventionNotify(r.Context(), meta, fmt.Sprintf("🚫 任务 %s 已取消（项目 %s）", taskID, meta.ProjectID))
-	httputil.WriteJSON(w, http.StatusOK, h.buildWorkflow(meta, team, false))
+	httputil.WriteJSON(w, http.StatusOK, h.buildWorkflow(meta, team, false, time.Time{}))
 }
 
 // isTerminalTaskStatus reports whether a project task node status is terminal
@@ -3628,5 +3778,5 @@ func (h *ProjectHandler) CompleteProject(w http.ResponseWriter, r *http.Request)
 		"actor":      authzActor(caller),
 	}, meta.AuditSeq)
 	h.interventionNotify(r.Context(), meta, fmt.Sprintf("✅ 项目 %s 已完成", meta.ProjectID))
-	httputil.WriteJSON(w, http.StatusOK, h.buildWorkflow(meta, pwc.team, false))
+	httputil.WriteJSON(w, http.StatusOK, h.buildWorkflow(meta, pwc.team, false, time.Time{}))
 }
